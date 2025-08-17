@@ -20,7 +20,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from langchain_openai import ChatOpenAI 
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from firecrawl import FirecrawlApp, ScrapeOptions
 
 # --- Configuration ---
 class Config:
@@ -96,33 +97,44 @@ class FirecrawlDocumentationScraper:
         """Crawl documentation using Firecrawl API."""
         try:
             logger.info(f"Starting Firecrawl crawl from: {base_url}")
-            # <<< IMPROVEMENT: Using the 'params' dictionary for cleaner API calls
-            crawl_params = {
-                'crawlerOptions': {
-                    'excludes': ['/api/v.*', '/download/.*', '/login.*', '/signup.*'],
-                    'limit': self.config.MAX_PAGES,
-                }
-            }
-            crawl_result = self.app.crawl_url(base_url, params=crawl_params)
-            
-            if not crawl_result:
-                logger.error("Firecrawl returned no result.")
+        
+            # Crawl with minimal parameters to avoid parameter errors
+            crawl_result = self.app.crawl_url(
+                base_url,
+                limit=self.config.MAX_PAGES
+            )
+        
+            # crawl_result is a CrawlStatusResponse object
+            # Access the 'data' attribute to get the list of crawled pages
+            if not crawl_result or not hasattr(crawl_result, 'data'):
+                logger.error("Firecrawl returned no result or invalid format.")
                 return []
-                
-            logger.info(f"Successfully crawled {len(crawl_result)} pages with Firecrawl")
-            return crawl_result
+        
+            # Get the actual crawled pages from the data attribute
+            crawled_pages = crawl_result.data
+            logger.info(f"Successfully crawled {len(crawled_pages)} pages")
+        
+            return crawled_pages
+
         except Exception as e:
-            logger.error(f"Firecrawl crawling error: {e}")
+            logger.error(f"Firecrawl crawling error: {e}", exc_info=True)
             return []
 
-    def convert_to_langchain_documents(self, pages_data: List[Dict[str, Any]]) -> List[Document]:
+    def convert_to_langchain_documents(self, pages_data: List[Any]) -> List[Document]:
         """Convert Firecrawl results to LangChain Documents."""
         documents = []
+        # 'pages_data' is a list of FirecrawlDocument objects
         for page in pages_data:
             try:
-                content = page.get('markdown', page.get('content', ''))
-                metadata = page.get('metadata', {})
-                source = metadata.get('sourceURL', 'Unknown')
+                # --- FIX: Changed from .get() to attribute access ---
+                # Access 'markdown' or 'content' directly from the page object
+                content = page.markdown if hasattr(page, 'markdown') else page.content
+                
+                # Access metadata attributes directly
+                metadata = page.metadata if hasattr(page, 'metadata') else {}
+                source = metadata.get('sourceURL', 'Unknown') # Metadata is still a dict
+                title = metadata.get('title', '')
+                # --- END FIX ---
                 
                 if len(content.strip()) < self.config.MIN_CONTENT_LENGTH:
                     continue
@@ -131,7 +143,7 @@ class FirecrawlDocumentationScraper:
                     page_content=content.strip(),
                     metadata={
                         'source': source,
-                        'title': metadata.get('title', ''),
+                        'title': title,
                     }
                 )
                 documents.append(doc)
@@ -150,33 +162,152 @@ class EnhancedRAGPipeline:
         self.vector_store = None
         self._initialize_models()
         self._load_existing_vector_store()
+        
+    def generate_guidance(self, task_description: str, context: str) -> str:
+        """Generates technical guidance for a specific task using RAG context."""
+        
+        prompt_template = """
+You are "AI Tech Lead," an expert software architect and mentor. Your task is to provide detailed, actionable guidance for a specific development task.
+
+**Instructions:**
+1.  Explain the best way to approach the task.
+2.  Provide a concise code skeleton or example in the appropriate language.
+3.  If the context mentions internal best practices, emphasize them.
+4.  Keep the explanation clear and to the point.
+
+---
+**Internal Documentation Context:**
+{context}
+
+---
+**Development Task:**
+"{task}"
+
+---
+**Your Guidance:**
+"""
+        
+        prompt = prompt_template.format(context=context, task=task_description)
+        
+        logger.info(f"Generating guidance for: '{task_description}'")
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content
+        except Exception as e:
+            logger.error(f"Failed to generate guidance from LLM: {e}", exc_info=True)
+            return "Sorry, I encountered an error while generating guidance."
+        
+    def generate_plan(self, feature_request: str) -> str:
+        """Generates a technical plan using the LLM without RAG context."""
+    
+        # <<< FIX: Added a clear example to the prompt for better formatting >>>
+        prompt_template = """
+You are "AI Tech Lead," an expert software architect. Your task is to decompose a high-level feature request into a detailed, actionable technical plan.
+
+**Output Format Rules:**
+- Use GitHub Flavored Markdown.
+- Start with a high-level "Architecture Overview."
+- Create two main sections: "## 📝 Backend Tasks" and "## 🎨 Frontend Tasks."
+- **Crucially, every task MUST be a checklist item with a unique ID in the format (TID-B#) for backend or (TID-F#) for frontend.**
+
+**EXAMPLE OUTPUT:**
+## 📝 Backend Tasks
+- [ ] (TID-B1) Set up a new database schema for user profiles.
+- [ ] (TID-B2) Create API endpoint GET /api/users/{{id}}.
+## 🎨 Frontend Tasks
+- [ ] (TID-F1) Design the main profile page component in React.
+- [ ] (TID-F2) Implement state management for user data.
+
+---
+
+**Feature Request:** "{request}"
+"""
+    
+        prompt = prompt_template.format(request=feature_request)
+    
+        logger.info(f"Generating plan for: '{feature_request}'")
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content
+        except Exception as e:
+            logger.error(f"Failed to generate plan from LLM: {e}", exc_info=True)
+            return "Sorry, I encountered an error while generating the plan."
+        
+    def add_to_vector_store(self, base_url: str) -> bool:
+        """
+        Crawls a URL and adds the documents to the existing vector store
+        without deleting previous content.
+        """
+        if not self.vector_store:
+            # If no database exists, this command should just create one.
+            logger.info("No existing vector store found. Calling create_vector_store instead.")
+            return self.create_vector_store(base_url)
+        
+        try:
+            logger.info(f"Adding new documents from URL: {base_url}")
+            start_time = time.time()
+
+            # 1. Crawl and process the new documents
+            scraper = FirecrawlDocumentationScraper(self.config)
+            pages_data = scraper.crawl_documentation(base_url)
+            if not pages_data:
+                return False
+
+            documents = scraper.convert_to_langchain_documents(pages_data)
+            if not documents:
+                return False
+
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.config.CHUNK_SIZE,
+                chunk_overlap=self.config.CHUNK_OVERLAP
+            )
+            splits = text_splitter.split_documents(documents)
+            if not splits:
+                logger.error("No text chunks created after splitting.")
+                return False
+            
+            # 2. Add the new document splits to the existing database
+            logger.info(f"Adding {len(splits)} new text chunks to the vector store.")
+            self.vector_store.add_documents(documents=splits)
+            
+            total_time = time.time() - start_time
+            logger.info(f"Successfully added new documents in {total_time:.2f} seconds.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to add documents to vector store: {e}", exc_info=True)
+            return False
 
     def _initialize_models(self):
         """Initialize LLM and embedding models with error handling."""
-        # <<< START: MODIFIED SECTION
         try:
-            # 1. Set up the LLM to use the CloudRift API
+            # 1. Set up the API key for CloudRift
             rift_api_key = os.getenv("RIFT_API_KEY")
             if not rift_api_key:
                 raise ValueError("RIFT_API_KEY not found in environment variables.")
 
+            # 2. Set up the LLM to use the CloudRift API
             self.llm = ChatOpenAI(
                 model="meta-llama/Meta-Llama-3.1-70B-Instruct-FP8",
                 api_key=rift_api_key,
                 base_url="https://inference.cloudrift.ai/v1"
+         )
+        
+            # 3. Set up the embedding model to ALSO use the CloudRift API
+            self.embeddings = OpenAIEmbeddings(
+                model="nomic-embed-text", # Use a model hosted by CloudRift
+                api_key=rift_api_key,
+                base_url="https://inference.cloudrift.ai/v1"
             )
-            
-            # 2. Keep using the local model for embeddings (fast and free)
-            self.embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
-            # 3. Test that both models are accessible
+            # 4. Test that the LLM is accessible
             self.llm.invoke("test") # Test connection to CloudRift
-            logger.info("CloudRift LLM and local embedding models initialized successfully")
-            
+            logger.info("CloudRift LLM and Embedding models initialized successfully")
+        
         except Exception as e:
             logger.error(f"❌ Failed to initialize models: {e}")
-            raise RuntimeError(f"Model initialization failed. For the LLM, check your RIFT_API_KEY. For embeddings, ensure Ollama is running.")
-        # <<< END: MODIFIED SECTION
+            # Updated error message no longer mentions Ollama
+            raise RuntimeError(f"Model initialization failed. Check your RIFT_API_KEY and network connection.")
 
     def _load_existing_vector_store(self):
         """Load existing vector store from disk if available."""

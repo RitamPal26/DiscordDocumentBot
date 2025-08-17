@@ -1,247 +1,375 @@
 # bot.py
 
 import discord
+from discord import app_commands
 from discord.ext import commands
+from discord.ui import Button, View
+from dotenv import load_dotenv
 import os
 import asyncio
 import logging
-from dotenv import load_dotenv
 import re
-from typing import Optional
 from urllib.parse import urlparse
 
 # Import your RAG pipeline
 from rag_pipeline import EnhancedRAGPipeline, Config
+import db_manager
 
-# Load environment variables
+# --- Initial Setup ---
 load_dotenv()
+db_manager.init_db()
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Bot configuration
+# --- Bot Configuration ---
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-if not DISCORD_TOKEN:
-    raise ValueError("DISCORD_TOKEN not found in environment variables. Please add it to your .env file.")
+DECISION_LOG_CHANNEL = os.getenv('DECISION_LOG_CHANNEL', 'project-decisions')
+RIFT_API_KEY = os.getenv("RIFT_API_KEY")
+
+if not DISCORD_TOKEN or not RIFT_API_KEY:
+    raise ValueError("DISCORD_TOKEN and RIFT_API_KEY must be in your .env file.")
 
 # Initialize RAG pipeline
 config = Config()
-rag_pipeline = EnhancedRAGPipeline(config)
+rag_pipeline_instance = EnhancedRAGPipeline(config)
 
-# Bot setup with necessary intents
+# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
-
+intents.messages = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Global state management
 learning_in_progress = False
 current_documentation_domain = ""
 
-# <<< IMPROVEMENT: Helper function for creating consistent embeds
+# --- Helper Functions ---
 def create_embed(title: str, description: str, color: discord.Color) -> discord.Embed:
     """Creates a standardized Discord embed."""
     embed = discord.Embed(title=title, description=description, color=color)
-    embed.set_footer(text="Powered by Firecrawl & Ollama")
+    embed.set_footer(text="Powered by Firecrawl & CloudRift")
     return embed
 
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+# --- The Main Interactive View Class ---
+class PlanView(View):
+    def __init__(self, tasks=None, message_id=None):
+        super().__init__(timeout=None)
+        if tasks and message_id:
+            # Create a set of buttons for each task
+            for original_id, description in tasks:
+                unique_task_id = f"{message_id}-{original_id}"
+                
+                self.add_item(Button(label=f"Claim {original_id}", style=discord.ButtonStyle.secondary, emoji="👀", custom_id=f"claim:{unique_task_id}"))
+                self.add_item(Button(label="Complete", style=discord.ButtonStyle.success, emoji="✅", custom_id=f"complete:{unique_task_id}"))
+                self.add_item(Button(label="Help", style=discord.ButtonStyle.primary, emoji="❓", custom_id=f"help:{unique_task_id}"))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        custom_id = interaction.data['custom_id']
+        action, unique_task_id = custom_id.split(":", 1)
+
+        if action == "claim":
+            await self.handle_claim(interaction, unique_task_id)
+        elif action == "complete":
+            await self.handle_complete(interaction, unique_task_id)
+        elif action == "help":
+            await self.handle_help(interaction, unique_task_id)
+        
+        return False
+
+    async def handle_claim(self, interaction: discord.Interaction, task_id: str):
+        db_manager.update_task_status(task_id, 'in_progress', interaction.user.id)
+        await interaction.response.send_message(f"You've claimed task `{task_id.split('-')[1]}`!", ephemeral=True, delete_after=5)
+        await self.update_plan_message(interaction)
+
+    async def handle_complete(self, interaction: discord.Interaction, task_id: str):
+        db_manager.update_task_status(task_id, 'completed', interaction.user.id)
+        await interaction.response.send_message(f"You've completed task `{task_id.split('-')[1]}`! 🎉", ephemeral=True, delete_after=5)
+        await self.update_plan_message(interaction)
+
+    async def handle_help(self, interaction: discord.Interaction, task_id: str):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        task_description = db_manager.get_task_description(task_id)
+        if not task_description:
+            await interaction.followup.send("I couldn't find this task.", ephemeral=True)
+            return
+
+        # This context will be invalid until the 404 error is fixed
+        context = await asyncio.to_thread(rag_pipeline_instance.query_rag, f"How to implement: {task_description}")
+        guidance = await asyncio.to_thread(rag_pipeline_instance.generate_guidance, task_description, context)
+    
+        # <<< FIX: Split long guidance messages into chunks >>>
+        if len(guidance) > 1950:
+            chunks = [guidance[i:i + 1950] for i in range(0, len(guidance), 1950)]
+            await interaction.followup.send(f"### 💡 Guidance for `{task_id.split('-')[1]}`\n{chunks[0]}", ephemeral=True)
+            for chunk in chunks[1:]:
+                # Send subsequent chunks in new followup messages
+                await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(f"### 💡 Guidance for `{task_id.split('-')[1]}`\n{guidance}", ephemeral=True)
+
+    async def update_plan_message(self, interaction: discord.Interaction):
+        try:
+            message_id_match = re.search(r"`(\d+)`", interaction.message.content)
+            if not message_id_match:
+                return
+            message_id = int(message_id_match.group(1))
+        except (AttributeError, IndexError, TypeError):
+            logger.error("Could not parse message_id from control message content.")
+            return
+
+        original_plan_text, tasks = db_manager.get_plan_and_tasks(message_id)
+        
+        status_map = {task[0]: (task[2], task[3]) for task in tasks}
+        
+        task_regex = re.compile(r"-\s*\[\s*\]\s*\((TID-[FB]\d+)\)\s*(.*)")
+        updated_lines = []
+        for line in original_plan_text.split('\n'):
+            match = task_regex.search(line)
+            if match:
+                original_id, description = match.groups()
+                status, assignee_id = status_map.get(original_id, ('pending', None))
+                
+                if status == 'in_progress':
+                    prefix = "👀"
+                    assignee_mention = f" (Claimed by <@{assignee_id}>)" if assignee_id else ""
+                    updated_lines.append(f"- {prefix} ~`({original_id}) {description.strip()}`~{assignee_mention}")
+                elif status == 'completed':
+                    prefix = "✅"
+                    assignee_mention = f" (Completed by <@{assignee_id}>)" if assignee_id else ""
+                    updated_lines.append(f"- {prefix} ~~`({original_id}) {description.strip()}`~~{assignee_mention}")
+                else:
+                    updated_lines.append(line)
+            else:
+                updated_lines.append(line)
+        
+        try:
+            plan_message = await interaction.channel.fetch_message(message_id)
+            await plan_message.edit(content='\n'.join(updated_lines))
+        except discord.NotFound:
+            logger.error(f"Could not find original plan message with ID {message_id} to update.")
+        except discord.Forbidden:
+            logger.error(f"Missing permissions to edit message {message_id}.")
+
+
+# --- Bot Setup and Events ---
 @bot.event
 async def on_ready():
-    """Startup confirmation event."""
-    print(f"🤖 Bot is ready and online! Logged in as {bot.user}")
-    print(f"📊 Connected to {len(bot.guilds)} server(s)")
+    print(f"🤖 AI Tech Lead is online! Logged in as {bot.user}")
     
-    if rag_pipeline.has_knowledge_base():
-        print(f"📚 {rag_pipeline.get_knowledge_base_info()}")
-    else:
-        print("📚 No existing knowledge base found")
-    
+    if not hasattr(bot, 'persistent_views_added'):
+        bot.add_view(PlanView())
+        bot.persistent_views_added = True
+        print("✅ Persistent view registered.")
+
     try:
         synced = await bot.tree.sync()
-        print(f"⚡ Synced {len(synced)} command(s)")
+        print(f"⚡ Synced {len(synced)} command(s).")
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
-# <<< IMPROVEMENT: Added a central /help command
-@bot.tree.command(name="help", description="Show all available commands and how to use them")
+# --- Bot Commands ---
+@bot.tree.command(name="help", description="Shows a complete guide on how to use the bot")
 async def help(interaction: discord.Interaction):
-    """Displays a help message with all commands."""
-    embed = create_embed(
-        "🤖 How to Use the Docs Bot",
-        "Here are the commands you can use to interact with me:",
-        discord.Color.blue()
-    )
-    embed.add_field(
-        name="`/learn-docs [url]`",
-        value="Teach me from a documentation website. I'll crawl the site and build a persistent knowledge base.",
-        inline=False
-    )
-    embed.add_field(
-        name="`@me [your question]`",
-        value="Once I've learned from a doc, mention me and ask a question to get an answer based on the context.",
-        inline=False
-    )
-    embed.add_field(
-        name="`/status`",
-        value="Check my current status to see if I'm learning or what documentation I have loaded.",
-        inline=False
-    )
+    embed = create_embed("🚀 AI Tech Lead Guide", "I generate technical plans and help you track them.", discord.Color.blue())
+    embed.add_field(name="Workflow", value="1. Use `/plan` to generate a project plan.\n2. Use the buttons on the control messages to claim, complete, or get help on tasks.", inline=False)
+    embed.add_field(name="Commands", value="**/plan `[feature]`**: Creates a plan.\n**/learn-docs `[url]`**: Learns from a documentation website.\n**/add-docs `[url]`**: Adds to existing knowledge.\n**/status**: Checks my knowledge base.\n**/help**: Shows this guide.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="plan", description="Generate a technical plan for a new feature.")
+@app_commands.describe(feature_request="Describe the feature you want to build.")
+async def plan(interaction: discord.Interaction, feature_request: str):
+    await interaction.response.defer(thinking=True)
 
-@bot.tree.command(name="learn-docs", description="Learn from a documentation URL to answer questions")
+    technical_plan = rag_pipeline_instance.generate_plan(feature_request)
+
+    task_regex = re.compile(r"-\s*\[\s*\]\s*\((TID-[FB]\d+)\)\s*(.*)")
+    parsed_tasks = task_regex.findall(technical_plan)
+
+    if not parsed_tasks:
+        await interaction.followup.send("The generated plan didn't contain any actionable tasks. Please try again.")
+        return
+
+    # <<< FIX: Split the plan into chunks if it's too long >>>
+    plan_message = None
+    if len(technical_plan) <= 2000:
+        plan_message = await interaction.followup.send(technical_plan)
+    else:
+        plan_chunks = [technical_plan[i:i + 1990] for i in range(0, len(technical_plan), 1990)]
+        for i, chunk in enumerate(plan_chunks):
+            if i == 0:
+                plan_message = await interaction.followup.send(chunk)
+            else:
+                await interaction.channel.send(chunk)
+    # <<< END FIX >>>
+
+    db_manager.add_plan(plan_message.id, plan_message.channel.id, feature_request, technical_plan)
+
+    for original_id, description in parsed_tasks:
+        unique_task_id = f"{plan_message.id}-{original_id}"
+        db_manager.add_task(unique_task_id, plan_message.id, original_id, description)
+
+    task_chunks = list(chunks(parsed_tasks, 4))
+
+    for i, chunk in enumerate(task_chunks):
+        view = PlanView(tasks=chunk, message_id=plan_message.id)
+        target = plan_message.thread or interaction.channel
+        await target.send(f"**Interactive Controls for Plan `{plan_message.id}` (Part {i+1})**", view=view)
+
+# ... (keep your existing learn-docs, add-docs, on_message, and status commands) ...
+@bot.tree.command(name="learn-docs", description="Deletes old data and learns from a new documentation URL")
 async def learn_docs(interaction: discord.Interaction, url: str):
-    """Slash command to learn from documentation using Firecrawl."""
     global learning_in_progress, current_documentation_domain
-    
     url = url.strip()
     if not _is_valid_url(url):
         embed = create_embed("❌ Invalid URL", "Please provide a valid HTTP/HTTPS URL.", discord.Color.red())
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    
     if learning_in_progress:
         embed = create_embed("🤔 Already Learning", "I'm already busy learning. Please wait for that to complete.", discord.Color.orange())
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    
-    await interaction.response.defer()
-    
+    await interaction.response.defer(ephemeral=True)
     learning_in_progress = True
     domain = urlparse(url).netloc
     current_documentation_domain = domain
-    
     try:
-        start_embed = create_embed(
-            "🚀 Learning Started",
-            f"I'm now learning from `{domain}` using Firecrawl for fast scraping.\n\n*This may take 30-60 seconds...*",
-            discord.Color.blue()
-        )
+        start_embed = create_embed("🚀 Learning Started", f"Replacing my knowledge base with docs from `{domain}`...", discord.Color.blue())
         await interaction.followup.send(embed=start_embed)
-        
-        success = await asyncio.to_thread(rag_pipeline.create_vector_store, url)
-        
+        success = await asyncio.to_thread(rag_pipeline_instance.create_vector_store, url)
         if success:
-            knowledge_info = rag_pipeline.get_knowledge_base_info()
-            success_embed = create_embed(
-                "✅ Learning Complete!",
-                f"Successfully learned from `{domain}`. The knowledge base is now persistent and ready!\n\n**{knowledge_info}**",
-                discord.Color.green()
-            )
-            success_embed.add_field(name="How to Ask", value=f"Just mention me with your question, like `@{bot.user.display_name} How do I get started?`")
+            kb_info = rag_pipeline_instance.get_knowledge_base_info()
+            count = kb_info.get("count", 0)
+            success_embed = create_embed("✅ Learning Complete!", f"Successfully learned from `{domain}`. My knowledge base is now ready with **{count}** documents.", discord.Color.green())
             await interaction.followup.send(embed=success_embed)
         else:
-            fail_embed = create_embed(
-                "❌ Learning Failed",
-                f"Failed to learn from `{domain}`. Please check that the URL is a valid and accessible documentation site.",
-                discord.Color.red()
-            )
+            fail_embed = create_embed("❌ Learning Failed", f"Failed to learn from `{domain}`. Please check the URL and my console logs.", discord.Color.red())
             await interaction.followup.send(embed=fail_embed)
-            
     except Exception as e:
-        logger.error(f"Error during learning: {e}")
-        error_embed = create_embed("💥 An Unexpected Error Occurred", f"```{str(e)[:1000]}```", discord.Color.dark_red())
+        logger.error(f"Error during learning: {e}", exc_info=True)
+        error_embed = create_embed("💥 An Unexpected Error Occurred", "Something went wrong. Please check the logs.", discord.Color.dark_red())
+        await interaction.followup.send(embed=error_embed)
+    finally:
+        learning_in_progress = False
+
+@bot.tree.command(name="add-docs", description="Adds new documentation to the existing knowledge base")
+async def add_docs(interaction: discord.Interaction, url: str):
+    global learning_in_progress, current_documentation_domain
+    url = url.strip()
+    if not _is_valid_url(url):
+        embed = create_embed("❌ Invalid URL", "Please provide a valid HTTP/HTTPS URL.", discord.Color.red())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    if learning_in_progress:
+        embed = create_embed("🤔 Already Learning", "I'm already busy learning. Please wait for that to complete.", discord.Color.orange())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    learning_in_progress = True
+    domain = urlparse(url).netloc
+    current_documentation_domain = domain
+    try:
+        start_embed = create_embed("➕ Adding Knowledge", f"Adding documents from `{domain}` to my knowledge base...", discord.Color.blue())
+        await interaction.followup.send(embed=start_embed)
+        success = await asyncio.to_thread(rag_pipeline_instance.add_to_vector_store, url)
+        if success:
+            kb_info = rag_pipeline_instance.get_knowledge_base_info()
+            count = kb_info.get("count", 0)
+            success_embed = create_embed("✅ Knowledge Added!", f"Successfully added documents from `{domain}`. I now have **{count}** total documents.", discord.Color.green())
+            await interaction.followup.send(embed=success_embed)
+        else:
+            fail_embed = create_embed("❌ Add Failed", f"Failed to add documents from `{domain}`. Please check the URL and my console logs.", discord.Color.red())
+            await interaction.followup.send(embed=fail_embed)
+    except Exception as e:
+        logger.error(f"Error while adding docs: {e}", exc_info=True)
+        error_embed = create_embed("💥 An Unexpected Error Occurred", "Something went wrong. Please check the logs.", discord.Color.dark_red())
         await interaction.followup.send(embed=error_embed)
     finally:
         learning_in_progress = False
 
 @bot.event
 async def on_message(message):
-    """Handle incoming messages and respond to mentions."""
     if message.author == bot.user or bot.user not in message.mentions:
         return
-    
-     # --- Start of New "Decision Logger" Feature ---
-    # Check if the bot was mentioned and the trigger phrase "save this" is in the message
-    if bot.user in message.mentions and "save this" in message.content.lower():
-        
-        # 1. Ensure this is a reply to another message
+    if "save this" in message.content.lower():
         if not message.reference or not message.reference.message_id:
-            await message.reply("To save a decision, please use this command as a **reply** to the message you want to archive.", ephemeral=True, delete_after=15)
+            await message.reply("To save a decision, please use this command as a **reply** to the message you want to archive.", delete_after=15)
             return
-
         try:
-            # 2. Fetch the original message that is being replied to
             original_message = await message.channel.fetch_message(message.reference.message_id)
-
-            # 3. Find the dedicated archive channel
-            channel_name = os.getenv('DECISION_LOG_CHANNEL', 'project-decisions')
-            archive_channel = discord.utils.get(message.guild.text_channels, name=channel_name)
-
+            archive_channel = discord.utils.get(message.guild.text_channels, name=DECISION_LOG_CHANNEL)
             if not archive_channel:
-                await message.reply(f"I couldn't find the archive channel `#{channel_name}`. Please create it or check the name in the config.", ephemeral=True, delete_after=15)
+                await message.reply(f"I couldn't find the `#{DECISION_LOG_CHANNEL}` channel. An admin may need to create it.", delete_after=15)
                 return
-
-            # 4. Create a rich embed to store the decision for clarity
-            decision_embed = discord.Embed(
-                title="🎯 Decision Logged",
-                description=f"**Decision:**\n>>> {original_message.content}",
-                color=discord.Color.green(),
-                timestamp=original_message.created_at
-            )
-            decision_embed.set_author(name=original_message.author.display_name, icon_url=original_message.author.avatar.url)
+            decision_embed = discord.Embed(title="🎯 Decision Logged", description=f">>> {original_message.content}", color=discord.Color.green(), timestamp=original_message.created_at)
+            decision_embed.set_author(name=original_message.author.display_name, icon_url=original_message.author.avatar.url if original_message.author.avatar else None)
             decision_embed.add_field(name="Logged By", value=message.author.mention, inline=True)
             decision_embed.add_field(name="Original Context", value=f"[Jump to Message]({original_message.jump_url})", inline=True)
             decision_embed.set_footer(text=f"From #{original_message.channel.name}")
-
-            # 5. Send the embed to the archive channel and confirm to the user
             await archive_channel.send(embed=decision_embed)
-            await message.add_reaction("✅") # Add a checkmark to the user's "save this" message
-
-            # Stop processing here so it doesn't try to answer it as a question
-            return 
-            
-        except discord.NotFound:
-            await message.reply("I couldn't find the original message to save. It might have been deleted.", ephemeral=True, delete_after=15)
+            await message.add_reaction("✅")
         except Exception as e:
             logger.error(f"Error logging decision: {e}")
-            await message.reply("Sorry, something went wrong while trying to save that decision.", ephemeral=True, delete_after=15)
-            return
-    
-    if not rag_pipeline.has_knowledge_base():
-        reply_description = (
-            f"I'm currently learning from `{current_documentation_domain}`. Please try again in a moment."
-            if learning_in_progress
-            else "I haven't learned any documentation yet! An admin needs to use the `/learn-docs <url>` command first."
-        )
-        reply_title = "🔄 Still Learning..." if learning_in_progress else "📚 No Knowledge Base"
-        reply_color = discord.Color.orange() if learning_in_progress else discord.Color.red()
-        
-        embed = create_embed(reply_title, reply_description, reply_color)
-        await message.reply(embed=embed)
+            await message.add_reaction("❌")
         return
-    
     question = _extract_question(message.content, bot.user.id)
     if not question:
-        embed = create_embed("🤷 Need a Question", f"Please mention me with a specific question!\n\n**Example**: `@{bot.user.display_name} How do I install this?`", discord.Color.orange())
+        embed = create_embed("👋 Hello!", f"Please ask me a question after the mention.\n\n**Example**: `@{bot.user.display_name} How do I get started?`", discord.Color.blue())
         await message.reply(embed=embed)
         return
-    
+    if not rag_pipeline_instance.has_knowledge_base():
+        embed = create_embed("📚 No Knowledge Base", "My knowledge base is empty. An admin needs to use `/learn-docs` to teach me.", discord.Color.orange())
+        await message.reply(embed=embed)
+        return
     async with message.channel.typing():
         try:
-            answer = await asyncio.to_thread(rag_pipeline.query_rag, question)
-            
-            if len(answer) > 2000:
+            answer = await asyncio.to_thread(rag_pipeline_instance.query_rag, question)
+            if len(answer) > 1900:
                 chunks = _split_long_message(answer)
                 for i, chunk in enumerate(chunks):
-                    # <<< IMPROVEMENT: Create embed for the first chunk
                     if i == 0:
                         embed = create_embed(f"📖 Answer for: \"{question[:50]}...\"", chunk, discord.Color.dark_grey())
                         await message.reply(embed=embed)
                     else:
-                        await message.channel.send(chunk) # Send subsequent chunks as plain text
+                        await message.channel.send(chunk)
             else:
                 embed = create_embed(f"📖 Answer for: \"{question[:50]}...\"", answer, discord.Color.dark_grey())
                 await message.reply(embed=embed)
-                
         except Exception as e:
-            logger.error(f"Error processing question: {e}")
-            embed = create_embed("💥 Processing Error", "Sorry, I encountered an error. Please try rephrasing your question.", discord.Color.red())
+            logger.error(f"Error processing question: {e}", exc_info=True)
+            embed = create_embed("💥 Processing Error", "Sorry, an error occurred. Please try rephrasing or check the logs.", discord.Color.red())
             await message.reply(embed=embed)
 
+@bot.tree.command(name="status", description="Check bot status and current documentation")
+async def status(interaction: discord.Interaction):
+    if learning_in_progress:
+        title = "🔄 Learning in Progress"
+        status_msg = f"I'm currently processing docs from `{current_documentation_domain}`."
+        color = discord.Color.blue()
+    elif rag_pipeline_instance.has_knowledge_base():
+        kb_info = rag_pipeline_instance.get_knowledge_base_info()
+        count = kb_info.get("count", 0)
+        sources = kb_info.get("sources", [])
+        title = "✅ Ready to Help!"
+        status_msg = f"My knowledge base is loaded with **{count}** documents"
+        if sources:
+            source_text = ", ".join([f"**{source}**" for source in sources])
+            status_msg += f" from: {source_text}."
+        color = discord.Color.green()
+    else:
+        title = "📚 No Documentation Loaded"
+        status_msg = "Use `/learn-docs <url>` to get started!"
+        color = discord.Color.orange()
+    embed = create_embed(title, status_msg, color)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- Utility Functions ---
 def _is_valid_url(url: str) -> bool:
-    """Validate URL format."""
     try:
         result = urlparse(url)
         return all([result.scheme in ['http', 'https'], result.netloc])
@@ -249,101 +377,31 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 def _extract_question(message_content: str, bot_user_id: int) -> str:
-    """
-    Extract the question from a message that mentions the bot,
-    ignoring the 'save this' command.
-    """
-    # This pattern correctly removes the bot's mention
     mention_pattern = f"<@!?{bot_user_id}>"
     cleaned_content = re.sub(mention_pattern, "", message_content).strip()
-    
-    # <<< CHANGE IS HERE
-    # Check if the core content is the save command. If so, return an
-    # empty string so it's not treated as a question for the RAG pipeline.
     if "save this" in cleaned_content.lower():
         return ""
-    
-    # Normalize spacing and return the clean question
     return ' '.join(cleaned_content.split())
 
-def _split_long_message(text: str, max_length: int = 1980) -> list:
-    """
-    Intelligently splits a long message.
-    - Tries to split by paragraphs first.
-    - Then by sentences.
-    - Finally, does a hard split by words if a single paragraph is too long.
-    """
+def _split_long_message(text: str, max_length: int = 2000) -> list:
     chunks = []
-    
-    # Split by paragraphs to maintain formatting
-    paragraphs = text.split('\n\n')
-    current_chunk = ""
-    
-    for para in paragraphs:
-        if len(current_chunk) + len(para) + 2 > max_length:
-            chunks.append(current_chunk)
-            current_chunk = ""
-            
-        if len(para) > max_length:
-            # If a single paragraph is too long, split it by words
-            words = para.split(' ')
-            temp_para_chunk = ""
-            for word in words:
-                if len(temp_para_chunk) + len(word) + 1 > max_length:
-                    chunks.append(temp_para_chunk)
-                    temp_para_chunk = word
-                else:
-                    temp_para_chunk += f" {word}"
-            current_chunk = temp_para_chunk.strip()
-        else:
-            current_chunk += f"{para}\n\n"
-            
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-        
+    while len(text) > max_length:
+        split_point = text.rfind('\n\n', 0, max_length)
+        if split_point == -1: split_point = text.rfind('\n', 0, max_length)
+        if split_point == -1: split_point = text.rfind('. ', 0, max_length)
+        if split_point == -1: split_point = max_length
+        chunks.append(text[:split_point])
+        text = text[split_point:].lstrip()
+    chunks.append(text)
     return chunks
 
-@bot.tree.command(name="status", description="Check bot status and current documentation")
-async def status(interaction: discord.Interaction):
-    """Checks and reports the bot's current status."""
-    status_msg = ""
-    color = discord.Color.orange()
-
-    if learning_in_progress:
-        status_msg = f"I'm currently crawling and indexing `{current_documentation_domain}`."
-        title = "🔄 Learning in Progress"
-        color = discord.Color.blue()
-    
-    elif rag_pipeline.has_knowledge_base():
-        # 1. Get the new, detailed knowledge base info
-        kb_info = rag_pipeline.get_knowledge_base_info()
-        count = kb_info.get("count", 0)
-        sources = kb_info.get("sources", [])
-        
-        # 2. Build the descriptive status message
-        status_msg = f"My knowledge base is loaded and persistent.\nKnowledge base loaded with **{count}** documents"
-        
-        # 3. If sources were found, add them to the message
-        if sources:
-            source_text = ", ".join([f"{source} documents" for source in sources])
-            status_msg += f" which includes **{source_text}**."
-        
-        title = "✅ Ready to Help!"
-        color = discord.Color.green()
-
-    else:
-        title = "📚 No Documentation Loaded"
-        status_msg = "Use `/learn-docs <url>` to get started!"
-
-    embed = create_embed(title, status_msg, color)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
+# --- Main Execution ---
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("❌ Error: DISCORD_TOKEN not found.")
     else:
         try:
-            print("🚀 Starting the RAG Discord bot...")
+            print("🚀 Starting the AI Tech Lead bot...")
             bot.run(DISCORD_TOKEN)
         except discord.LoginFailure:
             print("❌ Error: Invalid Discord token. Please check your .env file.")

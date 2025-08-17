@@ -1,11 +1,10 @@
-# requirements.txt
-langchain
-langchain-community
-discord.py
-fastapi
-uvicorn
-chromadb
-beautifulsoup4
-python-dotenv
-selenium 
-webdriver-manager
+langchain==0.3.27
+langchain-community==0.3.27
+discord.py==2.5.2
+fastapi==0.116.1
+uvicorn==0.35.0
+chromadb==1.0.17
+beautifulsoup4==4.13.4
+python-dotenv==1.1.1
+selenium==4.35.0
+webdriver-manager==4.0.2
