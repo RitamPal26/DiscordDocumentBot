@@ -181,6 +181,15 @@ class MyBot:
 @bot.tree.command(name="help", description="Shows a complete guide on how to use the bot")
 async def help(interaction: discord.Interaction):
     """Shows a complete guide on how to use the bot."""
+    
+    CLIENT_ID = "1405836550264062042" 
+    
+    # It's good practice to define the URL here. 
+    # Add scopes and permissions as needed for your bot.
+    INVITE_URL = (
+        f"https://discord.com/oauth2/authorize?client_id={CLIENT_ID}"
+        "&scope=bot%20applications.commands&permissions=397537941568" # Common permissions
+    )
 
     # 1. Create the main embed object
     # The color can be customized to your bot's branding.
@@ -201,7 +210,7 @@ async def help(interaction: discord.Interaction):
         value=(
             "1. **Plan a Feature**: Use `/plan` to get a detailed, step-by-step technical plan for any feature you can describe.\n"
             "2. **Build Your Knowledge**: Use `/learn-docs` to have me read and understand a documentation website.\n"
-            "3. **Save Important Info**: Mention me (`@BluePrint`) in any message to save it directly to your knowledge base."
+            "3. **Save Important Info**: Mention me (`@BluePrint save this`) in any message to save it directly to # project-decisions channel."
         ),
         inline=False
     )
@@ -236,14 +245,28 @@ async def help(interaction: discord.Interaction):
     embed.add_field(
         name="✨ Special Features",
         value=(
-            "**Quick Save**: Simply **@BluePrint** at the start of any message to save its content to your knowledge base. "
-            "This is perfect for saving code snippets, important decisions, or team notes without a formal command."
+            "**Quick Save**: Simply **@BluePrint save this** to save important decisions on your project or **@BluePrint explain this <question>** to get a detailed explanation from the documentation you have trained me on !!."
         ),
         inline=False
     )
 
     # 5. Set a footer
     embed.set_footer(text="BluePrint | Your AI Project Partner")
+    
+    view = View()
+
+    # 2. Create a Button
+    # style=discord.ButtonStyle.link requires a `url` parameter.
+    # This button won't send an event to the bot; it just opens the URL.
+    button = Button(
+        label="Invite BluePrint to Your Server",
+        style=discord.ButtonStyle.link,
+        url=INVITE_URL,
+        emoji="🔗"
+    )
+
+    # 3. Add the button to the view
+    view.add_item(button)
 
     # 6. Send the response
     # ephemeral=True makes the message visible only to the user who ran the command.
