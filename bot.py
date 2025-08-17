@@ -160,7 +160,7 @@ class PlanView(View):
 # --- Bot Setup and Events ---
 @bot.event
 async def on_ready():
-    print(f"🤖 AI Tech Lead is online! Logged in as {bot.user}")
+    print(f"🤖 BluePrint is online! Logged in as {bot.user}")
     
     if not hasattr(bot, 'persistent_views_added'):
         bot.add_view(PlanView())
@@ -174,11 +174,79 @@ async def on_ready():
         logger.error(f"Failed to sync commands: {e}")
 
 # --- Bot Commands ---
+class MyBot:
+    tree = None # Placeholder for the app_commands.CommandTree
+# bot = MyBot() 
+
 @bot.tree.command(name="help", description="Shows a complete guide on how to use the bot")
 async def help(interaction: discord.Interaction):
-    embed = create_embed("🚀 AI Tech Lead Guide", "I generate technical plans and help you track them.", discord.Color.blue())
-    embed.add_field(name="Workflow", value="1. Use `/plan` to generate a project plan.\n2. Use the buttons on the control messages to claim, complete, or get help on tasks.", inline=False)
-    embed.add_field(name="Commands", value="**/plan `[feature]`**: Creates a plan.\n**/learn-docs `[url]`**: Learns from a documentation website.\n**/add-docs `[url]`**: Adds to existing knowledge.\n**/status**: Checks my knowledge base.\n**/help**: Shows this guide.", inline=False)
+    """Shows a complete guide on how to use the bot."""
+
+    # 1. Create the main embed object
+    # The color can be customized to your bot's branding.
+    embed = discord.Embed(
+        title="🚀 BluePrint Help Guide",
+        description=(
+            "Hello! I'm BluePrint, your AI-powered project assistant. "
+            "I help you generate technical plans, learn from documentation, "
+            "and manage your project knowledge base right here in Discord."
+        ),
+        color=discord.Color.from_rgb(52, 152, 219) # A nice blue color
+    )
+
+    # 2. Add the Core Workflow section
+    # This gives users a quick start guide.
+    embed.add_field(
+        name="🎯 Core Workflow",
+        value=(
+            "1. **Plan a Feature**: Use `/plan` to get a detailed, step-by-step technical plan for any feature you can describe.\n"
+            "2. **Build Your Knowledge**: Use `/learn-docs` to have me read and understand a documentation website.\n"
+            "3. **Save Important Info**: Mention me (`@BluePrint`) in any message to save it directly to your knowledge base."
+        ),
+        inline=False
+    )
+
+    # 3. Add the Commands section
+    # Using `>` (blockquote) and `*Example:*` makes the command explanations clearer.
+    embed.add_field(
+        name="Available Commands",
+        value=(
+            "**/plan `[feature]`**\n"
+            "> Creates a detailed, step-by-step technical plan for a new feature.\n"
+            "> *Example: `/plan create a user authentication system using OAuth`*\n\n"
+            
+            "**/learn-docs `[url]`**\n"
+            "> Ingests and learns from a public documentation website.\n"
+            "> *Example: `/learn-docs https://discordpy.readthedocs.io/en/stable/`*\n\n"
+            
+            "**/add-docs `[url]`**\n"
+            "> Adds a new documentation website to your existing knowledge base.\n\n"
+            
+            "**/status**\n"
+            "> Checks the current status of your knowledge base.\n\n"
+
+            "**/help**\n"
+            "> Shows this guide."
+        ),
+        inline=False
+    )
+
+    # 4. Add the Special Features section
+    # Highlighting the @mention functionality is important as it's not a slash command.
+    embed.add_field(
+        name="✨ Special Features",
+        value=(
+            "**Quick Save**: Simply **@BluePrint** at the start of any message to save its content to your knowledge base. "
+            "This is perfect for saving code snippets, important decisions, or team notes without a formal command."
+        ),
+        inline=False
+    )
+
+    # 5. Set a footer
+    embed.set_footer(text="BluePrint | Your AI Project Partner")
+
+    # 6. Send the response
+    # ephemeral=True makes the message visible only to the user who ran the command.
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="plan", description="Generate a technical plan for a new feature.")
