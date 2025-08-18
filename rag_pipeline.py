@@ -13,6 +13,7 @@ import re
 # Firecrawl import
 from firecrawl import FirecrawlApp
 
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_ollama import ChatOllama
 from langchain_ollama import OllamaEmbeddings
@@ -294,11 +295,10 @@ You are "AI Tech Lead," an expert software architect. Your task is to decompose 
          )
         
             # 3. Set up the embedding model to ALSO use the CloudRift API
-            self.embeddings = OpenAIEmbeddings(
-                model="nomic-embed-text", # Use a model hosted by CloudRift
-                api_key=rift_api_key,
-                base_url="https://inference.cloudrift.ai/v1"
-            )
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",  # A popular, efficient model for text embeddings
+                 model_kwargs={"device": "cpu"}  # Change to "cuda" if you have a GPU for faster performance
+        )
 
             # 4. Test that the LLM is accessible
             self.llm.invoke("test") # Test connection to CloudRift
