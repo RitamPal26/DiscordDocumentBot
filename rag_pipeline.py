@@ -13,7 +13,7 @@ import re
 # Firecrawl import
 from firecrawl import FirecrawlApp
 
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_chroma import Chroma
 from langchain_ollama import ChatOllama
 from langchain_ollama import OllamaEmbeddings
@@ -292,12 +292,13 @@ You are "AI Tech Lead," an expert software architect. Your task is to decompose 
                 model="meta-llama/Meta-Llama-3.1-70B-Instruct-FP8",
                 api_key=rift_api_key,
                 base_url="https://inference.cloudrift.ai/v1"
-         )
+        )
         
             # 3. Set up the embedding model to ALSO use the CloudRift API
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",  # A popular, efficient model for text embeddings
-                 model_kwargs={"device": "cpu"}  # Change to "cuda" if you have a GPU for faster performance
+            self.embeddings = HuggingFaceEndpointEmbeddings(
+                repo_id="sentence-transformers/all-mpnet-base-v2",
+                task="feature-extraction",
+                huggingfacehub_api_token=os.getenv("HF_API_TOKEN")
         )
 
             # 4. Test that the LLM is accessible
