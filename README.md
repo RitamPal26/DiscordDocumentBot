@@ -18,7 +18,7 @@
 
 ## 🎬 Demo
 
-[![Video Demo](https://i.vimeocdn.com/video/76979871_640x360.jpg)](https://vimeo.com/76979871)
+[![Video Demo](https://i.vimeocdn.com/video/1110819082_640x360.jpg)](https://vimeo.com/1110819082)
 
 ---
 
