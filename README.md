@@ -18,7 +18,7 @@
 
 ## 🎬 Demo
 
-<iframe src="https://player.vimeo.com/video/1110819082" width="640" height="360" frameborder="0" allowfullscreen></iframe>
+[![Video Demo](https://i.vimeocdn.com/video/76979871_640x360.jpg)](https://vimeo.com/76979871)
 
 ---
 
