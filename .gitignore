@@ -9,7 +9,6 @@ __pycache__/
 # dotenv & secrets
 .env
 *.env
-*.env.*
 
 # Logs
 *.log
@@ -27,3 +26,9 @@ chroma_db/
 # OS / tooling noise
 .DS_Store
 Thumbs.db
+
+# Local databases
+*.db
+
+# Tooling
+git-filter-repo/
