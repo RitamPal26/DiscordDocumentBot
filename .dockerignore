@@ -1,0 +1,16 @@
+# Ignore virtual environment
+venv/
+.venv/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore local database files
+chroma_db/
+chroma_db_835f20d9/
+
+# Ignore Git directory
+.git
